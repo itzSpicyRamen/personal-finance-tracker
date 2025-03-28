@@ -1,9 +1,11 @@
 # personal-finance-tracker
 
-WIP Project
+WIP Project <br />
 
-Current features:
--Database creation
--Add new users to database
--Create new login via JSON post
--Use Google SSO to login or create a new account
+Current features: <br />
+-Database creation <br />
+-Add new users to database <br />
+-Create new login via JSON post <br />
+-Use Google SSO to login or create a new account <br />
+-Access and refresh token generation and handling <br />
+-Admin role in case needed <br />

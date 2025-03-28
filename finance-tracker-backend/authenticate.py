@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
 from pydantic import BaseModel
 from database import get_db_connection
 from datetime import datetime, timedelta
@@ -7,6 +8,7 @@ from starlette.requests import Request
 import secrets
 import bcrypt
 import jwt
+from jwt import ExpiredSignatureError, InvalidTokenError, PyJWTError
 import os
 import logging
 import requests
@@ -29,6 +31,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = os.getenv("ALGORITHM")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES"))
+REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS"))
 
 oauth = OAuth()
 oauth.register(
@@ -40,6 +43,7 @@ oauth.register(
     access_token_url="https://oauth2.googleapis.com/token",
     client_kwargs={"scope": "openid email profile"},
 )
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 class UserSignup(BaseModel):
     email: str
@@ -48,6 +52,14 @@ class UserSignup(BaseModel):
 class UserLogin(BaseModel):
     email: str
     password: str
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+################################################
+#            HELPER FUNCTIONS                  #
+################################################
+
 
 # Hash password
 def hash_password(password: str) -> str:
@@ -66,6 +78,47 @@ def generate_access_token(data: dict, expires_delta: timedelta):
     to_encode.update({"exp": expiration_time})
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
+async def get_google_user_info(access_token: str):
+    url = "https://www.googleapis.com/oauth2/v3/userinfo"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 200:
+        return response.json()
+    else:
+        logger.error(f"Error retrieving user info: {response.status_code} - {response.text}")
+        return None
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_email = payload.get("sub")
+        if user_email is None:
+            raise HTTPException(status_code=401, detail="Could not validate credentials")
+    except PyJWTError:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+    
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE email = %s;", (user_email,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if user is None:
+        raise HTTPException(status_code=401, detail="Could not validate credentials")
+    return user
+
+def check_admin_priv(user: dict = Depends(get_current_user)):
+    if user['role'] != 'admin':
+        raise HTTPException(status_code=403, detail="Ths role does not have admin privileges.")
+
+################################################
+#                ENDPOINTS                     #
+################################################
+
+
 # Route to user signup
 @router.post("/signup")
 def user_signup(user: UserSignup):
@@ -81,7 +134,7 @@ def user_signup(user: UserSignup):
     
     hashed_user_password = hash_password(user.password)
     cur.execute("INSERT INTO users (email, password) VALUES (%s, %s) RETURNING id;", 
-                (user.email, hashed_user_password))
+                (user.email, hashed_user_password, 'user'))
     user_id = cur.fetchone()["id"]
 
     conn.commit()
@@ -105,12 +158,14 @@ def login(user: UserLogin):
         raise HTTPException(status_code=400, detail="Invalid credentials")
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    refresh_token_expires = timedelta(minutes=REFRESH_TOKEN_EXPIRE_DAYS)
     access_token = generate_access_token(data={"sub": user.email}, expires_delta=access_token_expires)
+    refresh_token = generate_access_token(data={"sub": user.email}, expires_delta=refresh_token_expires)
 
     cur.close()
     conn.close()
     logger.info(f"Login successful for email: {user.email}")
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
 # Google login redirect
 @router.get("/auth/google")
@@ -137,14 +192,13 @@ async def google_callback(request: Request):
     logger.info(f"Token received: {token}")
 
     access_token = token['access_token']
-    user_info = await get_user_info(access_token)
+    user_info = await get_google_user_info(access_token)
 
     if not user_info:
         logger.error("Failed to retrieve user info")
         raise HTTPException(status_code=400, detail="Failed to retrieve user info")
 
     email = user_info["email"]
-    name = user_info.get("name", "")
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -154,24 +208,34 @@ async def google_callback(request: Request):
 
     if not existing_user:
         cur.execute("INSERT INTO users (email, password) VALUES (%s, %s) RETURNING id;",
-                    (email, "GOOGLE_SSO"),)
+                    (email, "GOOGLE_SSO", 'user'),)
         conn.commit()
 
     cur.close()
     conn.close()
 
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    refresh_token_expires = timedelta(minutes=REFRESH_TOKEN_EXPIRE_DAYS)
     access_token = generate_access_token(data={"sub": email}, expires_delta=access_token_expires)
+    refresh_token = generate_access_token(data={"sub": email}, expires_delta=refresh_token_expires)
 
-    return {"access_token": access_token, "token_type": "bearer"}
+    return {"access_token": access_token, "refresh_token": refresh_token, "token_type": "bearer"}
 
-async def get_user_info(access_token: str):
-    url = "https://www.googleapis.com/oauth2/v3/userinfo"
-    headers = {"Authorization": f"Bearer {access_token}"}
-    response = requests.get(url, headers=headers)
+@router.post("/refresh")
+def refresh_access_token(request: RefreshTokenRequest):
+    try:
+        payload = jwt.decode(request.refresh_token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
 
-    if response.status_code == 200:
-        return response.json()
-    else:
-        logger.error(f"Error retrieving user info: {response.status_code} - {response.text}")
-        return None
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+
+        access_token_expires = timedelta(minutes=30)
+        new_access_token = generate_access_token({"sub": email}, access_token_expires)
+
+        return {"access_token": new_access_token, "token_type": "bearer"}
+
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token expired")
+    except InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid refresh token")
